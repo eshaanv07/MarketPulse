@@ -1,4 +1,3 @@
-
 .dashboard {
   min-height: 100vh;
   background: #0b111b;
@@ -471,3 +470,37 @@ footer {
     flex-direction: column;
   }
 }
+
+/* TWO-PAGE NAVIGATION */
+.page-nav{display:flex;align-items:center;gap:10px;padding:12px 5%;background:#0e1723;border-bottom:1px solid #263244}
+.page-nav-button{display:inline-flex;align-items:center;gap:8px;border:1px solid #304155;border-radius:8px;padding:10px 15px;background:#172333;color:#aab7c8;cursor:pointer;font:inherit;font-size:13px;font-weight:600}
+.page-nav-button:hover,.page-nav-button.active{color:#00d6a0;border-color:#00a982;background:#10352e}
+.history-controls{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}
+.history-controls label{display:flex;flex-direction:column;gap:8px;color:#aab7c8;font-size:12px;font-weight:600}
+.history-controls select{width:100%;border:1px solid #304155;border-radius:7px;padding:11px 12px;background:#172333;color:#e7edf5;font:inherit}
+.history-placeholder{margin-top:20px;min-height:230px;display:flex;align-items:center;justify-content:center;flex-direction:column;text-align:center}
+.history-placeholder h2{margin:12px 0 8px;font-size:18px}
+.history-placeholder p{max-width:650px;color:#9aabc0;font-size:13px;line-height:1.7}
+.history-placeholder-icon{color:#00d6a0;padding:14px;border-radius:12px;background:#10352e}
+.history-status{margin-top:12px;color:#e6a83b;background:#46351c;padding:7px 11px;border-radius:5px;font-size:11px}
+.history-alerts{align-items:stretch;text-align:left;min-height:150px}
+.history-alerts .panel-header{margin-bottom:4px}
+@media(max-width:700px){.page-nav{padding:10px 3%}.page-nav-button{flex:1;justify-content:center;padding:9px 8px;font-size:11px}.history-controls{grid-template-columns:1fr}}
+
+
+/* Historical analytics data states and summary */
+.history-message {
+  color: #91a1b6;
+  padding: 28px 4px;
+  text-align: center;
+}
+.history-error { color: #fca5a5; }
+.history-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px 24px;
+  color: #a8b6c8;
+  font-size: 13px;
+  margin: 8px 0 18px;
+}
+.history-chart-panel { min-height: 390px; }

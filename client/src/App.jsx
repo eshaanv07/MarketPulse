@@ -1,4 +1,3 @@
-
 import { useEffect, useState } from "react";
 import { io } from "socket.io-client";
 import {
@@ -41,9 +40,17 @@ function App() {
   const [clients, setClients] = useState(0);
   const [alerts, setAlerts] = useState([]);
   const [selectedSymbol, setSelectedSymbol] = useState("BTCUSDT");
+  const [activePage, setActivePage] = useState("live");
   const [systemStatusOpen, setSystemStatusOpen] = useState(false);
   const [systemInfo, setSystemInfo] = useState(null);
   const [systemStatusLoading, setSystemStatusLoading] = useState(false);
+  const [historySymbol, setHistorySymbol] = useState("BTCUSDT");
+  const [historyRange, setHistoryRange] = useState("1h");
+  const [historyInterval, setHistoryInterval] = useState("1m");
+  const [historicalCandles, setHistoricalCandles] = useState([]);
+  const [historicalAlerts, setHistoricalAlerts] = useState([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState("");
 
   const selectedAsset = ASSETS.find(asset => asset.symbol === selectedSymbol) || ASSETS[0];
 
@@ -136,6 +143,47 @@ function App() {
 
   const latestTrade = trades[0];
 
+  useEffect(() => {
+    if (activePage !== "history") return undefined;
+
+    let cancelled = false;
+    const loadHistoricalData = async () => {
+      setHistoryLoading(true);
+      setHistoryError("");
+      try {
+        const params = new URLSearchParams({
+          symbol: historySymbol,
+          range: historyRange,
+          interval: historyInterval
+        });
+        const [marketResponse, alertsResponse] = await Promise.all([
+          fetch(`${SOCKET_URL}/api/market/history?${params.toString()}`),
+          fetch(`${SOCKET_URL}/api/alerts?symbol=${encodeURIComponent(historySymbol)}&limit=50&page=1`)
+        ]);
+        if (!marketResponse.ok) {
+          const body = await marketResponse.json().catch(() => ({}));
+          throw new Error(body.error || `Historical data request failed (${marketResponse.status})`);
+        }
+        if (!alertsResponse.ok) {
+          throw new Error(`Historical alerts request failed (${alertsResponse.status})`);
+        }
+        const marketData = await marketResponse.json();
+        const alertData = await alertsResponse.json();
+        if (!cancelled) {
+          setHistoricalCandles(Array.isArray(marketData.candles) ? marketData.candles : []);
+          setHistoricalAlerts(Array.isArray(alertData.alerts) ? alertData.alerts : []);
+        }
+      } catch (error) {
+        if (!cancelled) setHistoryError(error.message || "Unable to load historical data.");
+      } finally {
+        if (!cancelled) setHistoryLoading(false);
+      }
+    };
+
+    loadHistoricalData();
+    return () => { cancelled = true; };
+  }, [activePage, historySymbol, historyRange, historyInterval]);
+
   return (
     <div className="dashboard">
 
@@ -157,7 +205,11 @@ function App() {
           </button>
         </div>
       </header>
-
+      <nav className="page-nav" aria-label="Main navigation">
+        <button type="button" className={activePage === "live" ? "page-nav-button active" : "page-nav-button"} onClick={() => setActivePage("live")}><Activity size={16} /> Live Dashboard</button>
+        <button type="button" className={activePage === "history" ? "page-nav-button active" : "page-nav-button"} onClick={() => setActivePage("history")}><TrendingUp size={16} /> Historical Analytics</button>
+      </nav>
+      {activePage === "live" ? (
       <main className="main-content">
 
         <section className="welcome">
@@ -519,7 +571,71 @@ function App() {
         </section>
 
       </main>
+      ) : (
+        <main className="main-content historical-page">
+          <section className="welcome">
+            <div><p className="eyebrow">MARKET DATA EXPLORER</p><h1>Historical Analytics</h1><p className="subtitle">Explore previously collected cryptocurrency trades and market activity.</p></div>
+            <div className="exchange"><Database size={17} /> MONGODB HISTORY</div>
+          </section>
+          <section className="panel history-intro">
+            <div className="panel-header"><div><h2>Historical market data</h2><p>Choose an asset and a period to investigate its past performance.</p></div></div>
+            <div className="history-controls">
+              <label>Cryptocurrency<select aria-label="Historical cryptocurrency" value={historySymbol} onChange={event => setHistorySymbol(event.target.value)}>{ASSETS.map(asset => <option key={asset.symbol} value={asset.symbol}>{asset.name} ({asset.short}/USDT)</option>)}</select></label>
+              <label>Time range<select aria-label="Historical time range" value={historyRange} onChange={event => setHistoryRange(event.target.value)}><option value="1h">Last hour</option><option value="24h">Last 24 hours</option><option value="7d">Last 7 days</option><option value="30d">Last 30 days</option></select></label>
+              <label>Candle interval<select aria-label="Historical candle interval" value={historyInterval} onChange={event => setHistoryInterval(event.target.value)}><option value="1m">1 minute</option><option value="5m">5 minutes</option><option value="15m">15 minutes</option><option value="1h">1 hour</option><option value="1d">1 day</option></select></label>
+            </div>
+          </section>
 
+          <section className="panel history-chart-panel">
+            <div className="panel-header">
+              <div><h2>{ASSETS.find(asset => asset.symbol === historySymbol)?.name || historySymbol} price history</h2><p>OHLC candles aggregated from trades stored in MongoDB</p></div>
+              <span className="live-tag">HISTORICAL</span>
+            </div>
+            {historyLoading ? <p className="history-message">Loading historical market data…</p> :
+              historyError ? <p className="history-message history-error" role="alert">{historyError}</p> :
+              historicalCandles.length === 0 ? <p className="history-message">No stored trades were found for this asset and time range.</p> : (
+                <>
+                  <div className="history-summary">
+                    <span>{historicalCandles.length} candles</span>
+                    <span>Latest close: ${Number(historicalCandles[historicalCandles.length - 1].close).toLocaleString(undefined, { maximumFractionDigits: 6 })}</span>
+                    <span>Total base volume: {historicalCandles.reduce((sum, candle) => sum + Number(candle.volume || 0), 0).toLocaleString(undefined, { maximumFractionDigits: 4 })}</span>
+                  </div>
+                  <div style={{ width: "100%", height: 340 }}>
+                    <ResponsiveContainer>
+                      <AreaChart data={historicalCandles}>
+                        <defs><linearGradient id="historicalPriceFill" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor="#00d6a0" stopOpacity={0.28}/><stop offset="95%" stopColor="#00d6a0" stopOpacity={0}/></linearGradient></defs>
+                        <CartesianGrid strokeDasharray="3 3" stroke="#263548" />
+                        <XAxis dataKey="time" tickFormatter={value => new Date(value).toLocaleString()} minTickGap={32} stroke="#8292a8" />
+                        <YAxis domain={["auto", "auto"]} tickFormatter={value => Number(value).toLocaleString()} stroke="#8292a8" />
+                        <Tooltip labelFormatter={value => new Date(value).toLocaleString()} formatter={(value, name) => [Number(value).toLocaleString(undefined, { maximumFractionDigits: 8 }), name]} contentStyle={{ background: "#101b2a", border: "1px solid #334155", borderRadius: 8 }} />
+                        <Area type="monotone" dataKey="close" name="Close price" stroke="#00d6a0" fill="url(#historicalPriceFill)" strokeWidth={2} />
+                      </AreaChart>
+                    </ResponsiveContainer>
+                  </div>
+                </>
+              )}
+          </section>
+
+          <section className="panel history-alerts">
+            <div className="panel-header"><div><h2>Historical Market Alerts</h2><p>Previously detected price movements and volume anomalies</p></div><span className="live-tag">{historicalAlerts.length} ALERTS</span></div>
+            {historyLoading ? <p className="history-message">Loading historical alerts…</p> :
+              historicalAlerts.length === 0 ? <p className="history-message">No stored alerts found for this asset.</p> : (
+                <div className="alerts-list">
+                  {historicalAlerts.map((alert, index) => (
+                    <div className={`alert-card ${String(alert.severity || "").toLowerCase()}`} key={alert._id || `${alert.symbol}-${alert.timestamp}-${index}`}>
+                      <div className="alert-icon">{alert.type === "PRICE_MOVEMENT" ? <TrendingUp size={21}/> : <Activity size={21}/>}</div>
+                      <div className="alert-content">
+                        <div className="alert-heading"><strong>{alert.symbol}</strong><span className="alert-type">{String(alert.type || "").replaceAll("_", " ")}</span><span className={`severity ${String(alert.severity || "").toLowerCase()}`}>{alert.severity}</span></div>
+                        <p>{alert.message}</p>
+                        <span className="alert-time">{alert.timestamp ? new Date(alert.timestamp).toLocaleString() : "—"}</span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+          </section>
+        </main>
+      )}
       {systemStatusOpen && (
         <div
           className="system-status-backdrop"

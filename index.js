@@ -89,6 +89,103 @@ const io = new Server(server, {
   }
 });
 
+
+// -------------------------------------
+// HISTORICAL MARKET DATA API
+// -------------------------------------
+// Example: /api/market/history?symbol=BTCUSDT&range=24h&interval=5m
+app.get("/api/market/history", async (req, res) => {
+  try {
+    const symbol = String(req.query.symbol || "BTCUSDT").toUpperCase();
+    const ranges = {
+      "1h": 60 * 60 * 1000,
+      "24h": 24 * 60 * 60 * 1000,
+      "7d": 7 * 24 * 60 * 60 * 1000,
+      "30d": 30 * 24 * 60 * 60 * 1000
+    };
+    const intervals = {
+      "1m": { unit: "minute", binSize: 1 },
+      "5m": { unit: "minute", binSize: 5 },
+      "15m": { unit: "minute", binSize: 15 },
+      "1h": { unit: "hour", binSize: 1 },
+      "1d": { unit: "day", binSize: 1 }
+    };
+
+    const range = String(req.query.range || "1h");
+    const interval = String(req.query.interval || "1m");
+
+    if (!symbols.includes(symbol)) {
+      return res.status(400).json({ error: "Unsupported market symbol." });
+    }
+    if (!ranges[range]) {
+      return res.status(400).json({ error: "Unsupported time range. Use 1h, 24h, 7d, or 30d." });
+    }
+    if (!intervals[interval]) {
+      return res.status(400).json({ error: "Unsupported candle interval. Use 1m, 5m, 15m, 1h, or 1d." });
+    }
+
+    const to = new Date();
+    const from = new Date(to.getTime() - ranges[range]);
+    const bucket = intervals[interval];
+
+    const candles = await Trade.aggregate([
+      {
+        $match: {
+          symbol,
+          tradeTime: { $gte: from, $lte: to }
+        }
+      },
+      { $sort: { tradeTime: 1, tradeId: 1 } },
+      {
+        $group: {
+          _id: {
+            $dateTrunc: {
+              date: "$tradeTime",
+              unit: bucket.unit,
+              binSize: bucket.binSize,
+              timezone: "UTC"
+            }
+          },
+          open: { $first: "$price" },
+          high: { $max: "$price" },
+          low: { $min: "$price" },
+          close: { $last: "$price" },
+          volume: { $sum: "$quantity" },
+          quoteVolume: { $sum: { $multiply: ["$price", "$quantity"] } },
+          trades: { $sum: 1 }
+        }
+      },
+      { $sort: { _id: 1 } },
+      {
+        $project: {
+          _id: 0,
+          time: "$_id",
+          open: 1,
+          high: 1,
+          low: 1,
+          close: 1,
+          volume: 1,
+          quoteVolume: 1,
+          trades: 1
+        }
+      }
+    ]).allowDiskUse(true);
+
+    res.json({
+      symbol,
+      range,
+      interval,
+      from,
+      to,
+      count: candles.length,
+      candles
+    });
+  } catch (error) {
+    console.error("Historical market data API error:", error.message);
+    res.status(500).json({ error: "Unable to retrieve historical market data." });
+  }
+});
+
 // -------------------------------------
 // ALERT HISTORY API
 // -------------------------------------
