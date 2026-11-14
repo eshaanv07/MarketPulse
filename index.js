@@ -1,4 +1,4 @@
-
+const cors = require("cors");
 require("dotenv").config();
 
 const WebSocket = require("ws");
@@ -64,6 +64,16 @@ const MAX_ALERT_BUFFER_SIZE = 5000;
 // -------------------------------------
 
 const app = express();
+
+app.use(cors({
+  origin: [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173"
+  ],
+  methods: ["GET", "POST"]
+}));
+
+app.use(express.json());
 
 app.use(express.json());
 
