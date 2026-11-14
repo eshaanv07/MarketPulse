@@ -41,7 +41,6 @@ const symbols = [
   "BTCUSDT",
   "ETHUSDT",
   "SOLUSDT",
-  "BNBUSDT",
   "XRPUSDT"
 ];
 
@@ -59,6 +58,16 @@ const BROADCAST_INTERVAL = 250;
 const ALERT_BATCH_SIZE = 100;
 const MAX_ALERT_BUFFER_SIZE = 5000;
 
+// Storage-pressure thresholds (MongoDB db.stats estimate, not an exact Atlas quota meter).
+const STORAGE_THRESHOLDS_MB = { monitor: 400, cleanup: 440, aggressive: 460, critical: 480 };
+const STORAGE_CHECK_INTERVAL_MS = 60 * 1000;
+const STORAGE_CLEANUP_BATCH_PER_SYMBOL = 250;
+const STORAGE_MAX_ROUNDS_PER_CHECK = 3;
+const STORAGE_MIN_PROGRESS_MB = 1;
+const STORAGE_RETRY_COOLDOWN_MS = 5 * 60 * 1000;
+const STORAGE_CLEANER_ENABLED = true;
+
+
 // -------------------------------------
 // EXPRESS + HTTP + SOCKET.IO
 // -------------------------------------
@@ -72,8 +81,6 @@ app.use(cors({
   ],
   methods: ["GET", "POST"]
 }));
-
-app.use(express.json());
 
 app.use(express.json());
 
@@ -99,16 +106,13 @@ app.get("/api/market/history", async (req, res) => {
     const symbol = String(req.query.symbol || "BTCUSDT").toUpperCase();
     const ranges = {
       "1h": 60 * 60 * 1000,
-      "24h": 24 * 60 * 60 * 1000,
-      "7d": 7 * 24 * 60 * 60 * 1000,
-      "30d": 30 * 24 * 60 * 60 * 1000
+      "24h": 24 * 60 * 60 * 1000
     };
     const intervals = {
       "1m": { unit: "minute", binSize: 1 },
       "5m": { unit: "minute", binSize: 5 },
       "15m": { unit: "minute", binSize: 15 },
-      "1h": { unit: "hour", binSize: 1 },
-      "1d": { unit: "day", binSize: 1 }
+      "1h": { unit: "hour", binSize: 1 }
     };
 
     const range = String(req.query.range || "1h");
@@ -118,10 +122,10 @@ app.get("/api/market/history", async (req, res) => {
       return res.status(400).json({ error: "Unsupported market symbol." });
     }
     if (!ranges[range]) {
-      return res.status(400).json({ error: "Unsupported time range. Use 1h, 24h, 7d, or 30d." });
+      return res.status(400).json({ error: "Unsupported time range. Use 1h or 24h." });
     }
     if (!intervals[interval]) {
-      return res.status(400).json({ error: "Unsupported candle interval. Use 1m, 5m, 15m, 1h, or 1d." });
+      return res.status(400).json({ error: "Unsupported candle interval. Use 1m, 5m, 15m, or 1h." });
     }
 
     const to = new Date();
@@ -262,16 +266,43 @@ app.get("/api/alerts", async (req, res) => {
 app.get("/health", (req, res) => {
   res.json({
     status: "running",
-    database: mongoose.connection.readyState === 1
-      ? "connected"
-      : "disconnected",
+    database: mongoose.connection.readyState === 1 ? "connected" : "disconnected",
     connectedClients: io.engine.clientsCount,
     pendingAlerts: alertBuffer.length,
     timestamp: new Date()
   });
 });
 
-// -------------------------------------
+// Detailed system status, including estimated MongoDB storage usage.
+app.get("/api/system/status", async (req, res) => {
+  try {
+    const storage = await getStorageStats();
+    res.json({
+      status: "running",
+      database: mongoose.connection.readyState === 1 ? "connected" : "disconnected",
+      symbols,
+      storage,
+      cleaner: {
+        enabled: STORAGE_CLEANER_ENABLED,
+        running: storageCleanupRunning,
+        lastCleanupAt: lastStorageCleanupAt,
+        lastCleanupDeleted: lastStorageCleanupDeleted,
+        lastCleanupReason: lastStorageCleanupReason,
+        thresholdsMB: STORAGE_THRESHOLDS_MB
+      },
+      buffers: {
+        trades: writeBuffer.length,
+        alerts: alertBuffer.length,
+        broadcasts: outboundBatch.length
+      },
+      connectedClients: io.engine.clientsCount,
+      timestamp: new Date()
+    });
+  } catch (error) {
+    res.status(500).json({ error: "Unable to retrieve system status." });
+  }
+});
+
 // MARKET STATE
 // -------------------------------------
 
@@ -311,6 +342,158 @@ let maxProcessingTime = 0;
 let statsTimer;
 let flushTimer;
 let broadcastTimer;
+let storageTimer;
+let lastStorageCleanupAt = null;
+let lastStorageCleanupDeleted = 0;
+let lastStorageCleanupReason = "Not run yet";
+let lastStorageStats = null;
+let storageCleanupRunning = false;
+
+// -------------------------------------
+// STORAGE MONITOR + CONTROLLED CLEANER
+// -------------------------------------
+
+function mb(bytes) {
+  return Number((bytes / (1024 * 1024)).toFixed(2));
+}
+
+function getStorageLevel(usedMB) {
+  if (usedMB >= STORAGE_THRESHOLDS_MB.critical) return "CRITICAL";
+  if (usedMB >= STORAGE_THRESHOLDS_MB.aggressive) return "AGGRESSIVE";
+  if (usedMB >= STORAGE_THRESHOLDS_MB.cleanup) return "CLEANUP";
+  if (usedMB >= STORAGE_THRESHOLDS_MB.monitor) return "MONITOR";
+  return "NORMAL";
+}
+
+async function getStorageStats() {
+  const db = mongoose.connection.db;
+  if (!db) throw new Error("MongoDB database handle is not ready.");
+
+  const stats = await db.stats(1);
+  const allocatedBytes = Number(stats.storageSize || 0) + Number(stats.indexSize || 0);
+  const logicalBytes = Number(stats.dataSize || 0) + Number(stats.indexSize || 0);
+  const usedBytes = Math.max(allocatedBytes, logicalBytes);
+
+  const result = {
+    usedMB: mb(usedBytes),
+    allocatedMB: mb(allocatedBytes),
+    logicalMB: mb(logicalBytes),
+    dataMB: mb(Number(stats.dataSize || 0)),
+    indexMB: mb(Number(stats.indexSize || 0)),
+    level: getStorageLevel(mb(usedBytes)),
+    thresholdsMB: STORAGE_THRESHOLDS_MB,
+    source: "Conservative maximum of MongoDB db.stats allocated and logical estimates",
+    note: "Estimate only. Atlas quota usage may differ, and allocated storage may not shrink immediately after deletes."
+  };
+
+  lastStorageStats = result;
+  return result;
+}
+
+function cleanupRoundsForLevel(level) {
+  if (level === "CRITICAL") return STORAGE_MAX_ROUNDS_PER_CHECK;
+  if (level === "AGGRESSIVE") return 2;
+  if (level === "CLEANUP") return 1;
+  return 0;
+}
+
+async function deleteOldestTradesForSymbol(symbol, limit) {
+  const oldest = await Trade.find({ symbol })
+    .sort({ tradeTime: 1, tradeId: 1 })
+    .limit(limit)
+    .select({ _id: 1 })
+    .lean();
+
+  if (oldest.length === 0) return 0;
+
+  const result = await Trade.deleteMany({
+    _id: { $in: oldest.map(item => item._id) }
+  });
+
+  return Number(result.deletedCount || 0);
+}
+
+async function runStorageCheck() {
+  if (!STORAGE_CLEANER_ENABLED || storageCleanupRunning ||
+      mongoose.connection.readyState !== 1) return;
+
+  storageCleanupRunning = true;
+
+  try {
+    let storage = await getStorageStats();
+    console.log(
+      `[Storage] ${storage.usedMB} MB estimated (${storage.level}); ` +
+      `allocated=${storage.allocatedMB} MB, logical=${storage.logicalMB} MB`
+    );
+
+    const rounds = cleanupRoundsForLevel(storage.level);
+    if (rounds === 0) {
+      lastStorageCleanupReason = `No cleanup required (${storage.level}).`;
+      return;
+    }
+
+    if (lastStorageCleanupAt &&
+        Date.now() - lastStorageCleanupAt.getTime() < STORAGE_RETRY_COOLDOWN_MS) {
+      lastStorageCleanupReason = "Cleanup cooldown active; monitoring continues.";
+      return;
+    }
+
+    let totalDeleted = 0;
+    let previousUsedMB = storage.usedMB;
+
+    for (let round = 1; round <= rounds; round++) {
+      let roundDeleted = 0;
+
+      // Equal per-symbol limits ensure BTC, ETH, SOL and XRP are treated fairly.
+      for (const symbol of symbols) {
+        roundDeleted += await deleteOldestTradesForSymbol(
+          symbol,
+          STORAGE_CLEANUP_BATCH_PER_SYMBOL
+        );
+      }
+
+      totalDeleted += roundDeleted;
+      if (roundDeleted === 0) break;
+
+      await new Promise(resolve => setTimeout(resolve, 1500));
+      storage = await getStorageStats();
+
+      console.log(
+        `[Storage] Round ${round}/${rounds}: deleted ${roundDeleted} trades; ` +
+        `estimate now ${storage.usedMB} MB.`
+      );
+
+      const improvementMB = previousUsedMB - storage.usedMB;
+      if (improvementMB < STORAGE_MIN_PROGRESS_MB) {
+        console.warn(
+          "[Storage] Estimated usage did not fall by at least 1 MB. " +
+          "Stopping to avoid blind repeated deletion."
+        );
+        break;
+      }
+
+      previousUsedMB = storage.usedMB;
+      if (storage.usedMB < STORAGE_THRESHOLDS_MB.cleanup) break;
+    }
+
+    lastStorageCleanupAt = new Date();
+    lastStorageCleanupDeleted = totalDeleted;
+    lastStorageCleanupReason =
+      `Pressure cleanup; deleted ${totalDeleted} oldest trades using equal per-symbol limits.`;
+
+    if (totalDeleted > 0) {
+      console.warn(
+        `[Storage] Deleted ${totalDeleted} raw trades. ` +
+        "During pressure, retained history may be shorter than 24 hours."
+      );
+    }
+  } catch (error) {
+    lastStorageCleanupReason = `Storage check failed: ${error.message}`;
+    console.error("[Storage] Monitor/cleaner error:", error.message);
+  } finally {
+    storageCleanupRunning = false;
+  }
+}
 
 // -------------------------------------
 // SOCKET.IO CONNECTIONS
@@ -725,6 +908,12 @@ function startMonitoring() {
 
   // Periodically refresh market snapshots for clients.
   setInterval(broadcastMarketSnapshot, 2000);
+
+  // Storage monitoring is independent of the market-data write pipeline.
+  void runStorageCheck();
+  storageTimer = setInterval(() => {
+    void runStorageCheck();
+  }, STORAGE_CHECK_INTERVAL_MS);
 }
 
 // -------------------------------------
@@ -743,6 +932,7 @@ async function shutdown() {
   clearInterval(statsTimer);
   clearInterval(flushTimer);
   clearInterval(broadcastTimer);
+  clearInterval(storageTimer);
 
   if (socket) {
     socket.close();

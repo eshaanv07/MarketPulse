@@ -56,4 +56,10 @@ tradeSchema.index(
   { symbol: 1, tradeTime: -1 }
 );
 
+// Automatically expire raw trades after 24 hours.
+tradeSchema.index(
+  { tradeTime: 1 },
+  { expireAfterSeconds: 86400 }
+);
+
 module.exports = mongoose.model("Trade", tradeSchema);

@@ -28,7 +28,6 @@ const ASSETS = [
   { symbol: "BTCUSDT", name: "Bitcoin", short: "BTC" },
   { symbol: "ETHUSDT", name: "Ethereum", short: "ETH" },
   { symbol: "SOLUSDT", name: "Solana", short: "SOL" },
-  { symbol: "BNBUSDT", name: "BNB", short: "BNB" },
   { symbol: "XRPUSDT", name: "XRP", short: "XRP" }
 ];
 
@@ -581,8 +580,8 @@ function App() {
             <div className="panel-header"><div><h2>Historical market data</h2><p>Choose an asset and a period to investigate its past performance.</p></div></div>
             <div className="history-controls">
               <label>Cryptocurrency<select aria-label="Historical cryptocurrency" value={historySymbol} onChange={event => setHistorySymbol(event.target.value)}>{ASSETS.map(asset => <option key={asset.symbol} value={asset.symbol}>{asset.name} ({asset.short}/USDT)</option>)}</select></label>
-              <label>Time range<select aria-label="Historical time range" value={historyRange} onChange={event => setHistoryRange(event.target.value)}><option value="1h">Last hour</option><option value="24h">Last 24 hours</option><option value="7d">Last 7 days</option><option value="30d">Last 30 days</option></select></label>
-              <label>Candle interval<select aria-label="Historical candle interval" value={historyInterval} onChange={event => setHistoryInterval(event.target.value)}><option value="1m">1 minute</option><option value="5m">5 minutes</option><option value="15m">15 minutes</option><option value="1h">1 hour</option><option value="1d">1 day</option></select></label>
+              <label>Time range<select aria-label="Historical time range" value={historyRange} onChange={event => setHistoryRange(event.target.value)}><option value="1h">Last hour</option><option value="24h">Last 24 hours</option></select></label>
+              <label>Candle interval<select aria-label="Historical candle interval" value={historyInterval} onChange={event => setHistoryInterval(event.target.value)}><option value="1m">1 minute</option><option value="5m">5 minutes</option><option value="15m">15 minutes</option><option value="1h">1 hour</option></select></label>
             </div>
           </section>
 
