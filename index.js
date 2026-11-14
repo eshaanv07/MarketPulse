@@ -139,7 +139,10 @@ app.get("/api/market/history", async (req, res) => {
           tradeTime: { $gte: from, $lte: to }
         }
       },
-      { $sort: { tradeTime: 1, tradeId: 1 } },
+      // Use the existing { symbol: 1, tradeTime: -1 } index.
+      // Sorting ascending by both tradeTime and tradeId required a large
+      // in-memory sort for BTC and exceeded MongoDB's 32 MB limit.
+      { $sort: { tradeTime: -1 } },
       {
         $group: {
           _id: {
@@ -150,10 +153,11 @@ app.get("/api/market/history", async (req, res) => {
               timezone: "UTC"
             }
           },
-          open: { $first: "$price" },
+          // Input is newest-first, so first=close and last=open.
+          open: { $last: "$price" },
           high: { $max: "$price" },
           low: { $min: "$price" },
-          close: { $last: "$price" },
+          close: { $first: "$price" },
           volume: { $sum: "$quantity" },
           quoteVolume: { $sum: { $multiply: ["$price", "$quantity"] } },
           trades: { $sum: 1 }
