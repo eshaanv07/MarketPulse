@@ -40,6 +40,12 @@ function App() {
   const [connected, setConnected] = useState(false);
   const [clients, setClients] = useState(0);
   const [alerts, setAlerts] = useState([]);
+  const [selectedSymbol, setSelectedSymbol] = useState("BTCUSDT");
+  const [systemStatusOpen, setSystemStatusOpen] = useState(false);
+  const [systemInfo, setSystemInfo] = useState(null);
+  const [systemStatusLoading, setSystemStatusLoading] = useState(false);
+
+  const selectedAsset = ASSETS.find(asset => asset.symbol === selectedSymbol) || ASSETS[0];
 
   useEffect(() => {
     const socket = io(SOCKET_URL);
@@ -95,6 +101,30 @@ function App() {
     };
   }, []);
 
+  useEffect(() => {
+    if (!systemStatusOpen) return undefined;
+
+    let cancelled = false;
+    setSystemStatusLoading(true);
+
+    fetch(`${SOCKET_URL}/health`)
+      .then(response => {
+        if (!response.ok) throw new Error(`Health check failed (${response.status})`);
+        return response.json();
+      })
+      .then(data => {
+        if (!cancelled) setSystemInfo(data);
+      })
+      .catch(error => {
+        if (!cancelled) setSystemInfo({ error: error.message });
+      })
+      .finally(() => {
+        if (!cancelled) setSystemStatusLoading(false);
+      });
+
+    return () => { cancelled = true; };
+  }, [systemStatusOpen]);
+
   const formatPrice = value => {
     if (!Number.isFinite(value) || value === 0) return "—";
 
@@ -115,9 +145,16 @@ function App() {
           <span>MARKET<span className="accent">PULSE</span></span>
         </div>
 
-        <div className="top-status">
-          <span className={connected ? "live-dot" : "offline-dot"} />
-          {connected ? "LIVE MARKET DATA" : "CONNECTING"}
+        <div className="topbar-actions" style={{ display: "flex", alignItems: "center", gap: 12 }}>
+          <button
+            type="button"
+            className="system-status-trigger"
+            onClick={() => setSystemStatusOpen(true)}
+            style={{ border: "1px solid #334155", borderRadius: 8, padding: "9px 13px", background: "#172333", color: "#e5edf5", cursor: "pointer" }}
+          >
+            <Server size={16} style={{ verticalAlign: "middle", marginRight: 7 }} />
+            System status
+          </button>
         </div>
       </header>
 
@@ -286,11 +323,33 @@ function App() {
               <span className="live-tag">LIVE</span>
             </div>
 
+            <div className="chart-asset-selector" role="group" aria-label="Select cryptocurrency chart" style={{ display: "flex", flexWrap: "wrap", gap: 8, padding: "0 0 16px" }}>
+              {ASSETS.map(asset => (
+                <button
+                  key={asset.symbol}
+                  type="button"
+                  onClick={() => setSelectedSymbol(asset.symbol)}
+                  aria-pressed={selectedSymbol === asset.symbol}
+                  style={{
+                    border: selectedSymbol === asset.symbol ? "1px solid #00d6a0" : "1px solid #334155",
+                    background: selectedSymbol === asset.symbol ? "rgba(0,214,160,0.14)" : "#172333",
+                    color: selectedSymbol === asset.symbol ? "#00d6a0" : "#d5deea",
+                    borderRadius: 7,
+                    padding: "8px 13px",
+                    cursor: "pointer",
+                    fontWeight: 600
+                  }}
+                >
+                  {asset.short}
+                </button>
+              ))}
+            </div>
+
             <div className="chart-container">
 
               <ResponsiveContainer width="100%" height="100%">
                 <AreaChart
-                  data={history.BTCUSDT || []}
+                  data={history[selectedSymbol] || []}
                 >
                   <defs>
                     <linearGradient
@@ -339,7 +398,7 @@ function App() {
                     }}
                     formatter={value => [
                       `$${formatPrice(value)}`,
-                      "BTC Price"
+                      `${selectedAsset.short} Price`
                     ]}
                     labelFormatter={() => "Market update"}
                   />
@@ -358,7 +417,7 @@ function App() {
             </div>
 
             <div className="chart-caption">
-              BTC/USDT · Binance Spot · Live snapshots
+              {selectedAsset.short}/USDT · Binance Spot · Live snapshots
             </div>
 
           </div>
@@ -456,55 +515,57 @@ function App() {
 
           </div>
 
-          <div className="panel system-panel">
-
-            <div className="panel-header">
-              <div>
-                <h2>System Status</h2>
-                <p>Backend connectivity</p>
-              </div>
-            </div>
-
-            <div className="system-row">
-              <Server size={18} />
-              <span>Node.js Backend</span>
-              <strong className="positive">
-                {connected ? "ONLINE" : "OFFLINE"}
-              </strong>
-            </div>
-
-            <div className="system-row">
-              <Wifi size={18} />
-              <span>Socket.IO</span>
-              <strong className="positive">
-                {connected ? "CONNECTED" : "DISCONNECTED"}
-              </strong>
-            </div>
-
-            <div className="system-row">
-              <Database size={18} />
-              <span>MongoDB</span>
-              <strong>VERIFY VIA API</strong>
-            </div>
-
-            <div className="system-row">
-              <Activity size={18} />
-              <span>Latest trade</span>
-              <strong>
-                {latestTrade?.symbol || "WAITING"}
-              </strong>
-            </div>
-
-            <div className="system-note">
-              Market data is received from the MarketPulse
-              backend and distributed through Socket.IO.
-            </div>
-
-          </div>
 
         </section>
 
       </main>
+
+      {systemStatusOpen && (
+        <div
+          className="system-status-backdrop"
+          role="presentation"
+          onClick={() => setSystemStatusOpen(false)}
+          style={{ position: "fixed", inset: 0, zIndex: 1000, background: "rgba(0,0,0,0.68)", display: "grid", placeItems: "center", padding: 20 }}
+        >
+          <section
+            className="panel system-status-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="system-status-title"
+            onClick={event => event.stopPropagation()}
+            style={{ width: "min(520px, 100%)", padding: 24, background: "#101b2a", border: "1px solid #334155", borderRadius: 14, boxShadow: "0 20px 60px rgba(0,0,0,0.45)" }}
+          >
+            <div className="panel-header" style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 18 }}>
+              <div>
+                <h2 id="system-status-title">System status</h2>
+                <p>Live backend and database health</p>
+              </div>
+              <button type="button" onClick={() => setSystemStatusOpen(false)} aria-label="Close system status" style={{ background: "transparent", color: "#e5edf5", border: 0, fontSize: 24, cursor: "pointer" }}>×</button>
+            </div>
+
+            {systemStatusLoading ? (
+              <p>Checking system health…</p>
+            ) : systemInfo?.error ? (
+              <p role="alert">Unable to retrieve system health: {systemInfo.error}</p>
+            ) : systemInfo ? (
+              <>
+                <div className="system-row"><Server size={18} /><span>Node.js backend</span><strong>{systemInfo.status === "running" ? "ONLINE" : "OFFLINE"}</strong></div>
+                <div className="system-row"><Wifi size={18} /><span>Socket.IO</span><strong>{connected ? "CONNECTED" : "DISCONNECTED"}</strong></div>
+                <div className="system-row"><Database size={18} /><span>MongoDB</span><strong>{String(systemInfo.database || "unknown").toUpperCase()}</strong></div>
+                <div className="system-row"><Activity size={18} /><span>Connected clients</span><strong>{systemInfo.connectedClients ?? "—"}</strong></div>
+                <div className="system-note" style={{ marginTop: 14 }}>Last checked: {systemInfo.timestamp ? new Date(systemInfo.timestamp).toLocaleString() : "—"}</div>
+              </>
+            ) : (
+              <p>System health information is not available.</p>
+            )}
+
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 10, marginTop: 22 }}>
+              <button type="button" onClick={() => { setSystemInfo(null); setSystemStatusOpen(false); setTimeout(() => setSystemStatusOpen(true), 0); }} style={{ border: "1px solid #334155", borderRadius: 7, padding: "8px 12px", background: "#172333", color: "#e5edf5", cursor: "pointer" }}>Refresh</button>
+              <button type="button" onClick={() => setSystemStatusOpen(false)} style={{ border: 0, borderRadius: 7, padding: "8px 14px", background: "#00a982", color: "#061b17", cursor: "pointer", fontWeight: 700 }}>Close</button>
+            </div>
+          </section>
+        </div>
+      )}
 
       <footer>
         MARKETPULSE © 2026 · REAL-TIME MARKET INTELLIGENCE
