@@ -285,6 +285,7 @@ app.get("/api/system/status", async (req, res) => {
       cleaner: {
         enabled: STORAGE_CLEANER_ENABLED,
         running: storageCleanupRunning,
+        modelsReady,
         lastCleanupAt: lastStorageCleanupAt,
         lastCleanupDeleted: lastStorageCleanupDeleted,
         lastCleanupReason: lastStorageCleanupReason,
@@ -348,6 +349,8 @@ let lastStorageCleanupDeleted = 0;
 let lastStorageCleanupReason = "Not run yet";
 let lastStorageStats = null;
 let storageCleanupRunning = false;
+let modelsReady = false;
+let snapshotTimer;
 
 // -------------------------------------
 // STORAGE MONITOR + CONTROLLED CLEANER
@@ -369,21 +372,28 @@ async function getStorageStats() {
   const db = mongoose.connection.db;
   if (!db) throw new Error("MongoDB database handle is not ready.");
 
+  // This is the MarketPulseDB logical footprint, not the Atlas cluster-wide
+  // quota meter. Atlas may include other databases and replica-set overhead.
+  // db.stats(1) returns byte counts. Convert every byte metric to MB
+  // before comparing it with the 400/440/460/480 MB thresholds.
   const stats = await db.stats(1);
-  const allocatedBytes = Number(stats.storageSize || 0) + Number(stats.indexSize || 0);
-  const logicalBytes = Number(stats.dataSize || 0) + Number(stats.indexSize || 0);
-  const usedBytes = Math.max(allocatedBytes, logicalBytes);
+  const dataBytes = Number(stats.dataSize || 0);
+  const indexBytes = Number(stats.indexSize || 0);
+  const allocatedBytes = Number(stats.storageSize || 0);
+  const logicalBytes = dataBytes + indexBytes;
 
   const result = {
-    usedMB: mb(usedBytes),
-    allocatedMB: mb(allocatedBytes),
-    logicalMB: mb(logicalBytes),
-    dataMB: mb(Number(stats.dataSize || 0)),
-    indexMB: mb(Number(stats.indexSize || 0)),
-    level: getStorageLevel(mb(usedBytes)),
+    database: db.databaseName,
+    usedMB: mb(logicalBytes),
+    dataMB: mb(dataBytes),
+    indexMB: mb(indexBytes),
+    storageAllocatedMB: mb(allocatedBytes),
+    collections: Number(stats.collections || 0),
+    objects: Number(stats.objects || 0),
+    level: getStorageLevel(mb(logicalBytes)),
     thresholdsMB: STORAGE_THRESHOLDS_MB,
-    source: "Conservative maximum of MongoDB db.stats allocated and logical estimates",
-    note: "Estimate only. Atlas quota usage may differ, and allocated storage may not shrink immediately after deletes."
+    source: "MongoDB db.stats(1) byte values converted to MB: (dataSize + indexSize) / 1048576 for MarketPulseDB",
+    limitation: "This is a database-level estimate, not Atlas cluster-wide Data Size. Compare it with Atlas Metrics."
   };
 
   lastStorageStats = result;
@@ -422,8 +432,8 @@ async function runStorageCheck() {
   try {
     let storage = await getStorageStats();
     console.log(
-      `[Storage] ${storage.usedMB} MB estimated (${storage.level}); ` +
-      `allocated=${storage.allocatedMB} MB, logical=${storage.logicalMB} MB`
+      `[Storage] MarketPulseDB logical footprint: ${storage.usedMB} MB ` +
+      `(${storage.level}); data=${storage.dataMB} MB, indexes=${storage.indexMB} MB.`
     );
 
     const rounds = cleanupRoundsForLevel(storage.level);
@@ -439,12 +449,10 @@ async function runStorageCheck() {
     }
 
     let totalDeleted = 0;
-    let previousUsedMB = storage.usedMB;
-
     for (let round = 1; round <= rounds; round++) {
       let roundDeleted = 0;
 
-      // Equal per-symbol limits ensure BTC, ETH, SOL and XRP are treated fairly.
+      // Identical per-symbol allowance: no coin receives preferential treatment.
       for (const symbol of symbols) {
         roundDeleted += await deleteOldestTradesForSymbol(
           symbol,
@@ -455,40 +463,45 @@ async function runStorageCheck() {
       totalDeleted += roundDeleted;
       if (roundDeleted === 0) break;
 
-      await new Promise(resolve => setTimeout(resolve, 1500));
-      storage = await getStorageStats();
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      const after = await getStorageStats();
 
       console.log(
         `[Storage] Round ${round}/${rounds}: deleted ${roundDeleted} trades; ` +
-        `estimate now ${storage.usedMB} MB.`
+        `database logical footprint now ${after.usedMB} MB.`
       );
 
-      const improvementMB = previousUsedMB - storage.usedMB;
-      if (improvementMB < STORAGE_MIN_PROGRESS_MB) {
+      // Compare the database logical footprint, not allocated WiredTiger bytes.
+      // If it does not improve, stop rather than deleting repeatedly without evidence.
+      if (after.usedMB >= storage.usedMB - STORAGE_MIN_PROGRESS_MB) {
+        storage = after;
         console.warn(
-          "[Storage] Estimated usage did not fall by at least 1 MB. " +
-          "Stopping to avoid blind repeated deletion."
+          "[Storage] Logical database size did not fall by at least " +
+          `${STORAGE_MIN_PROGRESS_MB} MB. Stopping cleanup; check Atlas Metrics separately.`
         );
         break;
       }
 
-      previousUsedMB = storage.usedMB;
+      storage = after;
       if (storage.usedMB < STORAGE_THRESHOLDS_MB.cleanup) break;
     }
 
     lastStorageCleanupAt = new Date();
     lastStorageCleanupDeleted = totalDeleted;
     lastStorageCleanupReason =
-      `Pressure cleanup; deleted ${totalDeleted} oldest trades using equal per-symbol limits.`;
+      `Pressure cleanup completed; deleted ${totalDeleted} oldest trades ` +
+      "with equal per-symbol batch limits.";
 
     if (totalDeleted > 0) {
       console.warn(
-        `[Storage] Deleted ${totalDeleted} raw trades. ` +
-        "During pressure, retained history may be shorter than 24 hours."
+        `[Storage] Deleted ${totalDeleted} trades. Under pressure, retained raw history ` +
+        "may be shorter than 24 hours."
       );
     }
   } catch (error) {
     lastStorageCleanupReason = `Storage check failed: ${error.message}`;
+    // Avoid hammering Atlas when quota restrictions or permissions block cleanup.
+    lastStorageCleanupAt = new Date();
     console.error("[Storage] Monitor/cleaner error:", error.message);
   } finally {
     storageCleanupRunning = false;
@@ -907,7 +920,7 @@ function startMonitoring() {
   }, BROADCAST_INTERVAL);
 
   // Periodically refresh market snapshots for clients.
-  setInterval(broadcastMarketSnapshot, 2000);
+  snapshotTimer = setInterval(broadcastMarketSnapshot, 2000);
 
   // Storage monitoring is independent of the market-data write pipeline.
   void runStorageCheck();
@@ -933,6 +946,7 @@ async function shutdown() {
   clearInterval(flushTimer);
   clearInterval(broadcastTimer);
   clearInterval(storageTimer);
+  clearInterval(snapshotTimer);
 
   if (socket) {
     socket.close();
@@ -991,27 +1005,52 @@ process.on("SIGINT", shutdown);
 // -------------------------------------
 
 async function startApplication() {
+  console.log("Connecting to MongoDB...");
+
   try {
-    console.log("Connecting to MongoDB...");
-
     await connectDB();
-    await Trade.init();
-    await Alert.init();
+    console.log("MongoDB connected. Starting HTTP service and storage monitor.");
 
-    console.log("MongoDB ready.");
-
-    server.listen(PORT, () => {
+    // Start health/status endpoints even if model index initialization fails.
+    server.listen(PORT, async () => {
       console.log(`MarketPulse server running on port ${PORT}`);
       console.log(`Health check: http://localhost:${PORT}/health`);
+      console.log(`System status: http://localhost:${PORT}/api/system/status`);
 
-      startBinanceStream();
-      startMonitoring();
+      // Start the monitor before attempting model initialization.
+      void getStorageStats()
+        .then(stats => console.log(`[Storage] Initial database footprint: ${stats.usedMB} MB.`))
+        .catch(error => console.error("[Storage] Initial check failed:", error.message));
+
+      // Try a controlled cleanup before index initialization. This can help
+      // when Atlas quota pressure is preventing index creation. If collections
+      // are absent or deletes are blocked, the attempt logs the failure safely.
+      void runStorageCheck();
+
+      try {
+        await Trade.init();
+        await Alert.init();
+        modelsReady = true;
+        console.log("MongoDB models and indexes ready.");
+
+        // Run a pressure check immediately after models become usable.
+        void runStorageCheck();
+
+        startBinanceStream();
+        startMonitoring();
+      } catch (error) {
+        modelsReady = false;
+        console.error("Model initialization failed; HTTP status service remains available:", error.message);
+        console.error("Binance collection has NOT been started. Resolve the model/index issue, then restart.");
+        // Keep the server alive so health and storage status can still be inspected.
+        storageTimer = setInterval(() => {
+          void runStorageCheck();
+        }, STORAGE_CHECK_INTERVAL_MS);
+      }
     });
-
   } catch (error) {
-    console.error("Startup failed:", error.message);
-    process.exit(1);
+    console.error("MongoDB connection failed. HTTP service cannot start:", error.message);
+    process.exitCode = 1;
   }
 }
-
 startApplication();

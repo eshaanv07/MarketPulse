@@ -1,4 +1,3 @@
-
 const mongoose = require("mongoose");
 
 const alertSchema = new mongoose.Schema({
