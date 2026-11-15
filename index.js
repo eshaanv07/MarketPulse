@@ -57,13 +57,13 @@ const io = new Server(server, {
 });
 
 const analytics = createMarketAnalytics({
-  priceWindowMs: 60000,
+  priceWindowMs: 20000,
   priceThresholdPct: 0.5,
   volumeBucketMs: 10000,
   volumeMultiplier: 2.5,
   volumeStdDevMultiplier: 3,
   minVolumeBaselineBuckets: 12,
-  cooldownMs: 60000
+  cooldownMs: 20000
 });
 
 const market = Object.fromEntries(SYMBOLS.map(symbol => [

@@ -17,7 +17,7 @@ function createMarketAnalytics(config = {}) {
   // ---------------------------------------
 
   const CONFIG = {
-    priceWindowMs: config.priceWindowMs ?? 60000,
+    priceWindowMs: config.priceWindowMs ?? 20000,
 
     priceThresholdPct: config.priceThresholdPct ?? 0.5,
 
@@ -30,7 +30,7 @@ function createMarketAnalytics(config = {}) {
     minVolumeBaselineBuckets:
       config.minVolumeBaselineBuckets ?? 12,
 
-    cooldownMs: config.cooldownMs ?? 60000
+    cooldownMs: config.cooldownMs ?? 20000
   };
 
   // ---------------------------------------
