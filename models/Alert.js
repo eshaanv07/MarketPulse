@@ -50,25 +50,38 @@ const alertSchema = new mongoose.Schema({
   timestamp: {
     type: Date,
     required: true
-    // Do not add index: true here.
-    // The TTL index below creates the timestamp_1 index with expiry options.
   }
+
 }, {
   versionKey: false
 });
 
-// Optimizes newest-first alert history queries.
-alertSchema.index({ timestamp: -1 });
+alertSchema.index({
+  timestamp: -1
+});
 
-// Supports common filtered history queries.
-alertSchema.index({ symbol: 1, timestamp: -1 });
-alertSchema.index({ severity: 1, timestamp: -1 });
+alertSchema.index({
+  symbol: 1,
+  timestamp: -1
+});
 
-// Automatically expire alerts after 24 hours.
-// This is the only ascending { timestamp: 1 } index.
+alertSchema.index({
+  severity: 1,
+  timestamp: -1
+});
+
+
+// Automatically expire alerts after 3 hours.
 alertSchema.index(
-  { timestamp: 1 },
-  { expireAfterSeconds: 86400 }
+  {
+    timestamp: 1
+  },
+  {
+    expireAfterSeconds: 10800
+  }
 );
 
-module.exports = mongoose.model("Alert", alertSchema);
+module.exports = mongoose.model(
+  "Alert",
+  alertSchema
+);

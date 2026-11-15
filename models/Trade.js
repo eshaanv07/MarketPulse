@@ -50,15 +50,15 @@ tradeSchema.index(
   { unique: true }
 );
 
-// Make historical queries faster.
+// Support historical queries by symbol and trade time.
 tradeSchema.index(
   { symbol: 1, tradeTime: -1 }
 );
 
-// Automatically expire raw trades after 24 hours.
+// Automatically expire raw trades after 3 hours (10,800 seconds).
 tradeSchema.index(
   { tradeTime: 1 },
-  { expireAfterSeconds: 86400 }
+  { expireAfterSeconds: 10800 }
 );
 
 module.exports = mongoose.model("Trade", tradeSchema);

@@ -1,76 +1,36 @@
-const cors = require("cors");
 require("dotenv").config();
 
+const cors = require("cors");
 const WebSocket = require("ws");
 const mongoose = require("mongoose");
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
-const { performance } = require("perf_hooks");
+const { randomUUID } = require("crypto");
 
 const connectDB = require("./db");
-const Trade = require("./models/Trade");
+const Candle = require("./models/Candle");
 const Alert = require("./models/Alert");
 const createMarketAnalytics = require("./analytics");
 
-// -------------------------------------
-// CONFIGURATION
-// -------------------------------------
+const PORT = Number(process.env.PORT || 5000);
+const RETENTION_HOURS = 3;
+const RETENTION_MS = RETENTION_HOURS * 60 * 60 * 1000;
 
-const PORT = 5000;
+const SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"];
 
-// -------------------------------------
-// MARKET INTELLIGENCE ENGINE
-// -------------------------------------
-
-const marketAnalytics = createMarketAnalytics({
-  priceWindowMs: 60000,
-  priceThresholdPct: 0.5,
-
-  volumeBucketMs: 10000,
-  volumeMultiplier: 2.5,
-  volumeStdDevMultiplier: 3,
-
-  minVolumeBaselineBuckets: 12,
-  cooldownMs: 60000
-});
-
-console.log("Market Intelligence Engine initialized.");
-
-const symbols = [
-  "BTCUSDT",
-  "ETHUSDT",
-  "SOLUSDT",
-  "XRPUSDT"
-];
-
-const streams = symbols.map(
-  symbol => `${symbol.toLowerCase()}@trade`
-);
+const STREAMS = SYMBOLS.flatMap(symbol => [
+  `${symbol.toLowerCase()}@trade`,
+  `${symbol.toLowerCase()}@kline_1m`
+]);
 
 const BINANCE_URL =
-  `wss://stream.binance.com:9443/stream?streams=${streams.join("/")}`;
+  `wss://stream.binance.com:9443/stream?streams=${STREAMS.join("/")}`;
 
-const BATCH_SIZE = 500;
-const MAX_BUFFER_SIZE = 10000;
-const FLUSH_INTERVAL = 1000;
-const BROADCAST_INTERVAL = 250;
+const CANDLE_BATCH_SIZE = 100;
 const ALERT_BATCH_SIZE = 100;
-const MAX_ALERT_BUFFER_SIZE = 5000;
-
-// Storage-pressure thresholds (MongoDB db.stats estimate, not an exact Atlas quota meter).
-const STORAGE_THRESHOLDS_MB = { monitor: 400, cleanup: 440, aggressive: 460, critical: 480 };
-const STORAGE_CHECK_INTERVAL_MS = 60 * 1000;
-const STORAGE_CLEANUP_BATCH_PER_SYMBOL = 250;
-const STORAGE_MAX_ROUNDS_PER_CHECK = 3;
-const STORAGE_MIN_PROGRESS_MB = 1;
-const STORAGE_RETRY_COOLDOWN_MS = 5 * 60 * 1000;
-const STORAGE_CLEANER_ENABLED = true;
-
-
-// -------------------------------------
-// EXPRESS + HTTP + SOCKET.IO
-// -------------------------------------
+const WRITE_FLUSH_INTERVAL_MS = 2000;
+const MAX_PENDING_ALERTS = 5000;
 
 const app = express();
 
@@ -96,74 +56,692 @@ const io = new Server(server, {
   }
 });
 
+const analytics = createMarketAnalytics({
+  priceWindowMs: 60000,
+  priceThresholdPct: 0.5,
+  volumeBucketMs: 10000,
+  volumeMultiplier: 2.5,
+  volumeStdDevMultiplier: 3,
+  minVolumeBaselineBuckets: 12,
+  cooldownMs: 60000
+});
+
+const market = Object.fromEntries(SYMBOLS.map(symbol => [
+  symbol,
+  {
+    symbol,
+    price: 0,
+    volume10s: 0,
+    trades10s: 0,
+    totalEvents: 0,
+    recentTrades: []
+  }
+]));
+
+let binanceSocket = null;
+let reconnectTimer = null;
+let snapshotTimer = null;
+let liveStatsTimer = null;
+let writeFlushTimer = null;
+let isShuttingDown = false;
+
+const pendingCandles = new Map();
+let pendingAlerts = [];
+
+let candleFlushRunning = false;
+let alertFlushRunning = false;
+
+const metrics = {
+  receivedTrades: 0,
+  processedTrades: 0,
+  receivedFinalCandles: 0,
+  candleBatchesWritten: 0,
+  candleDocumentsWritten: 0,
+  alertBatchesWritten: 0,
+  alertDocumentsWritten: 0,
+  databaseErrors: 0,
+  lastCandleFlushAt: null,
+  lastAlertFlushAt: null
+};
+
+
+// -------------------------------------
+// MARKET SNAPSHOT
+// -------------------------------------
+
+function marketSnapshot() {
+  return Object.fromEntries(SYMBOLS.map(symbol => {
+    const state = market[symbol];
+
+    return [symbol, {
+      symbol,
+      price: state.price,
+      volume10s: state.volume10s,
+      trades10s: state.trades10s,
+      totalEvents: state.totalEvents
+    }];
+  }));
+}
+
+
+// -------------------------------------
+// NORMALIZE BINANCE TRADES
+// -------------------------------------
+
+function normalizeTrade(raw) {
+  const price = Number(raw.p);
+  const quantity = Number(raw.q);
+  const tradeId = Number(raw.t);
+  const time = Number(raw.T);
+
+  if (
+    !SYMBOLS.includes(raw.s) ||
+    !Number.isSafeInteger(tradeId) ||
+    !Number.isFinite(price) ||
+    price <= 0 ||
+    !Number.isFinite(quantity) ||
+    quantity <= 0 ||
+    !Number.isFinite(time)
+  ) {
+    return null;
+  }
+
+  return {
+    symbol: raw.s,
+    tradeId,
+    price,
+    quantity,
+    tradeTime: new Date(time),
+    isBuyerMaker: Boolean(raw.m)
+  };
+}
+
+
+// -------------------------------------
+// PROCESS LIVE TRADES IN MEMORY
+// -------------------------------------
+
+function handleTrade(raw) {
+  metrics.receivedTrades++;
+
+  const trade = normalizeTrade(raw);
+  if (!trade) return;
+
+  metrics.processedTrades++;
+
+  const state = market[trade.symbol];
+
+  state.price = trade.price;
+  state.totalEvents++;
+
+  state.recentTrades.push({
+    time: trade.tradeTime.getTime(),
+    quantity: trade.quantity
+  });
+
+  const cutoff = Date.now() - 10000;
+
+  while (
+    state.recentTrades.length &&
+    state.recentTrades[0].time < cutoff
+  ) {
+    state.recentTrades.shift();
+  }
+
+  state.trades10s = state.recentTrades.length;
+
+  state.volume10s = state.recentTrades.reduce(
+    (sum, item) => sum + item.quantity,
+    0
+  );
+
+  // Individual trades are processed in memory only.
+  // They are NOT inserted into MongoDB.
+
+  const detected = analytics.processTrade({
+    symbol: trade.symbol,
+    price: trade.price,
+    quantity: trade.quantity,
+    tradeTime: trade.tradeTime,
+    tradeId: trade.tradeId
+  });
+
+  if (detected.length) {
+    const uniquelyIdentifiedAlerts = detected.map(alert => ({
+      ...alert,
+      id: `${alert.symbol}-${alert.type}-${alert.timestamp.getTime()}-${randomUUID()}`
+    }));
+
+    pendingAlerts.push(...uniquelyIdentifiedAlerts);
+
+    if (pendingAlerts.length > MAX_PENDING_ALERTS) {
+      pendingAlerts = pendingAlerts.slice(-MAX_PENDING_ALERTS);
+    }
+
+    io.emit("market:alerts", uniquelyIdentifiedAlerts);
+  }
+
+  io.emit("market:trades", [{
+    ...trade,
+    eventTime: new Date(),
+    source: "BINANCE"
+  }]);
+}
+
+
+// -------------------------------------
+// QUEUE FINALIZED 1-MINUTE CANDLES
+// -------------------------------------
+
+function queueFinalizedKline(kline) {
+  if (
+    !kline ||
+    kline.x !== true ||
+    !SYMBOLS.includes(kline.s)
+  ) {
+    return;
+  }
+
+  const candleTime = new Date(Number(kline.t));
+
+  const values = {
+    symbol: kline.s,
+    interval: "1m",
+    candleTime,
+
+    open: Number(kline.o),
+    high: Number(kline.h),
+    low: Number(kline.l),
+    close: Number(kline.c),
+
+    volume: Number(kline.v),
+    quoteVolume: Number(kline.q),
+    trades: Number(kline.n),
+
+    updatedAt: new Date()
+  };
+
+  if (
+    !Number.isFinite(candleTime.getTime()) ||
+    ![
+      values.open,
+      values.high,
+      values.low,
+      values.close,
+      values.volume,
+      values.quoteVolume,
+      values.trades
+    ].every(Number.isFinite)
+  ) {
+    return;
+  }
+
+  metrics.receivedFinalCandles++;
+
+  const key =
+    `${values.symbol}|${values.interval}|${candleTime.getTime()}`;
+
+  pendingCandles.set(key, values);
+}
+
+
+// -------------------------------------
+// BATCH WRITE CANDLES
+// -------------------------------------
+
+async function flushCandleWrites() {
+  if (
+    candleFlushRunning ||
+    pendingCandles.size === 0
+  ) {
+    return;
+  }
+
+  candleFlushRunning = true;
+
+  const batch = Array.from(
+    pendingCandles.entries()
+  ).slice(0, CANDLE_BATCH_SIZE);
+
+  batch.forEach(([key]) => {
+    pendingCandles.delete(key);
+  });
+
+  const operations = batch.map(([, values]) => ({
+    updateOne: {
+      filter: {
+        symbol: values.symbol,
+        interval: values.interval,
+        candleTime: values.candleTime
+      },
+
+      update: {
+        $set: values
+      },
+
+      upsert: true
+    }
+  }));
+
+  try {
+    await Candle.bulkWrite(
+      operations,
+      { ordered: false }
+    );
+
+    metrics.candleBatchesWritten++;
+    metrics.candleDocumentsWritten += batch.length;
+    metrics.lastCandleFlushAt = new Date();
+
+  } catch (error) {
+    metrics.databaseErrors++;
+
+    console.error(
+      "Candle bulkWrite failed:",
+      error.message
+    );
+
+    // Requeue failed items unless a newer update
+    // for that candle has already arrived.
+
+    for (const [key, values] of batch) {
+      if (!pendingCandles.has(key)) {
+        pendingCandles.set(key, values);
+      }
+    }
+
+  } finally {
+    candleFlushRunning = false;
+  }
+}
+
+
+// -------------------------------------
+// BATCH WRITE ALERTS
+// -------------------------------------
+
+async function flushAlertWrites() {
+  if (
+    alertFlushRunning ||
+    pendingAlerts.length === 0
+  ) {
+    return;
+  }
+
+  alertFlushRunning = true;
+
+  const batch = pendingAlerts.splice(
+    0,
+    ALERT_BATCH_SIZE
+  );
+
+  const operations = batch.map(alert => ({
+    updateOne: {
+      filter: {
+        alertId: String(alert.id)
+      },
+
+      update: {
+        $setOnInsert: {
+          alertId: String(alert.id),
+
+          type: alert.type,
+          symbol: alert.symbol,
+          message: alert.message,
+          severity: alert.severity,
+
+          observedValue: Number(alert.observedValue),
+          baselineValue: Number(alert.baselineValue),
+
+          changePct:
+            alert.changePct == null
+              ? null
+              : Number(alert.changePct),
+
+          timestamp: alert.timestamp || new Date()
+        }
+      },
+
+      upsert: true
+    }
+  }));
+
+  try {
+    await Alert.bulkWrite(
+      operations,
+      { ordered: false }
+    );
+
+    metrics.alertBatchesWritten++;
+    metrics.alertDocumentsWritten += batch.length;
+    metrics.lastAlertFlushAt = new Date();
+
+  } catch (error) {
+    metrics.databaseErrors++;
+
+    console.error(
+      "Alert bulkWrite failed:",
+      error.message
+    );
+
+    pendingAlerts = batch
+      .concat(pendingAlerts)
+      .slice(-MAX_PENDING_ALERTS);
+
+  } finally {
+    alertFlushRunning = false;
+  }
+}
+
+
+// -------------------------------------
+// FLUSH ALL DATABASE QUEUES
+// -------------------------------------
+
+async function flushAllWrites() {
+  await Promise.all([
+    flushCandleWrites(),
+    flushAlertWrites()
+  ]);
+}
+
+
+// -------------------------------------
+// ENSURE 3-HOUR TTL INDEXES
+// -------------------------------------
+
+async function ensureThreeHourTTL(model, field) {
+  try {
+    await model.createCollection();
+
+  } catch (error) {
+    if (
+      error.code !== 48 &&
+      error.codeName !== "NamespaceExists"
+    ) {
+      throw error;
+    }
+  }
+
+  const indexes = await model.collection.indexes();
+
+  const existing = indexes.find(index =>
+    index.key &&
+    Object.keys(index.key).length === 1 &&
+    index.key[field] === 1
+  );
+
+  if (existing) {
+    await mongoose.connection.db.command({
+      collMod: model.collection.collectionName,
+
+      index: {
+        name: existing.name,
+        expireAfterSeconds: 10800
+      }
+    });
+  }
+}
+
+
+// -------------------------------------
+// BINANCE WEBSOCKET
+// -------------------------------------
+
+function connectBinance() {
+  if (isShuttingDown) return;
+
+  console.log("Connecting to Binance streams...");
+
+  binanceSocket = new WebSocket(BINANCE_URL);
+
+  binanceSocket.on("open", () => {
+    console.log("Binance WebSocket connected.");
+
+    console.log(
+      "Tracking:",
+      SYMBOLS.join(", ")
+    );
+  });
+
+  binanceSocket.on("message", raw => {
+    try {
+      const message = JSON.parse(raw.toString());
+      const data = message.data;
+
+      if (!data) return;
+
+      if (data.k) {
+        queueFinalizedKline(data.k);
+
+      } else if (
+        data.e === "trade" ||
+        data.p !== undefined
+      ) {
+        handleTrade(data);
+      }
+
+    } catch (error) {
+      console.error(
+        "Binance message processing error:",
+        error.message
+      );
+    }
+  });
+
+  binanceSocket.on("error", error => {
+    console.error(
+      "Binance WebSocket error:",
+      error.message
+    );
+  });
+
+  binanceSocket.on("close", () => {
+    if (isShuttingDown) return;
+
+    console.warn(
+      "Binance connection closed. Reconnecting in 5 seconds."
+    );
+
+    if (!reconnectTimer) {
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        connectBinance();
+      }, 5000);
+    }
+  });
+}
+
+
+// -------------------------------------
+// HEALTH CHECK
+// -------------------------------------
+
+app.get("/health", (_req, res) => {
+  res.json({
+    status: "running",
+
+    database:
+      mongoose.connection.readyState === 1
+        ? "connected"
+        : "disconnected",
+
+    connectedClients: io.engine.clientsCount,
+    timestamp: new Date()
+  });
+});
+
+
+// -------------------------------------
+// SYSTEM STATUS
+// -------------------------------------
+
+app.get("/api/system/status", (_req, res) => {
+  res.json({
+    status: "running",
+
+    database:
+      mongoose.connection.readyState === 1
+        ? "connected"
+        : "disconnected",
+
+    symbols: SYMBOLS,
+    retentionHours: RETENTION_HOURS,
+
+    storageMode:
+      "Finalized 1-minute candles; raw trades in memory only",
+
+    batching: {
+      candleBatchSize: CANDLE_BATCH_SIZE,
+      alertBatchSize: ALERT_BATCH_SIZE,
+      flushIntervalMs: WRITE_FLUSH_INTERVAL_MS,
+
+      pendingCandles: pendingCandles.size,
+      pendingAlerts: pendingAlerts.length,
+
+      candleFlushRunning,
+      alertFlushRunning
+    },
+
+    metrics,
+
+    connectedClients: io.engine.clientsCount,
+    timestamp: new Date()
+  });
+});
+
 
 // -------------------------------------
 // HISTORICAL MARKET DATA API
 // -------------------------------------
-// Example: /api/market/history?symbol=BTCUSDT&range=24h&interval=5m
+
 app.get("/api/market/history", async (req, res) => {
   try {
-    const symbol = String(req.query.symbol || "BTCUSDT").toUpperCase();
-    const ranges = {
+    const symbol = String(
+      req.query.symbol || "BTCUSDT"
+    ).toUpperCase();
+
+    const range = String(
+      req.query.range || "3h"
+    );
+
+    const interval = String(
+      req.query.interval || "1m"
+    );
+
+    const rangeMs = {
       "1h": 60 * 60 * 1000,
-      "24h": 24 * 60 * 60 * 1000
-    };
-    const intervals = {
-      "1m": { unit: "minute", binSize: 1 },
-      "5m": { unit: "minute", binSize: 5 },
-      "15m": { unit: "minute", binSize: 15 },
-      "1h": { unit: "hour", binSize: 1 }
-    };
+      "3h": RETENTION_MS
+    }[range];
 
-    const range = String(req.query.range || "1h");
-    const interval = String(req.query.interval || "1m");
+    const bucket = {
+      "1m": {
+        unit: "minute",
+        binSize: 1
+      },
 
-    if (!symbols.includes(symbol)) {
-      return res.status(400).json({ error: "Unsupported market symbol." });
+      "5m": {
+        unit: "minute",
+        binSize: 5
+      },
+
+      "15m": {
+        unit: "minute",
+        binSize: 15
+      },
+
+      "1h": {
+        unit: "hour",
+        binSize: 1
+      }
+
+    }[interval];
+
+    if (!SYMBOLS.includes(symbol)) {
+      return res.status(400).json({
+        error: "Unsupported symbol."
+      });
     }
-    if (!ranges[range]) {
-      return res.status(400).json({ error: "Unsupported time range. Use 1h or 24h." });
-    }
-    if (!intervals[interval]) {
-      return res.status(400).json({ error: "Unsupported candle interval. Use 1m, 5m, 15m, or 1h." });
+
+    if (!rangeMs || !bucket) {
+      return res.status(400).json({
+        error:
+          "Use range 1h or 3h and interval 1m, 5m, 15m or 1h."
+      });
     }
 
     const to = new Date();
-    const from = new Date(to.getTime() - ranges[range]);
-    const bucket = intervals[interval];
 
-    const candles = await Trade.aggregate([
+    const from = new Date(
+      to.getTime() - rangeMs
+    );
+
+    const candles = await Candle.aggregate([
       {
         $match: {
           symbol,
-          tradeTime: { $gte: from, $lte: to }
+          interval: "1m",
+
+          candleTime: {
+            $gte: from,
+            $lte: to
+          }
         }
       },
-      // Use the existing { symbol: 1, tradeTime: -1 } index.
-      // Sorting ascending by both tradeTime and tradeId required a large
-      // in-memory sort for BTC and exceeded MongoDB's 32 MB limit.
-      { $sort: { tradeTime: -1 } },
+
+      {
+        $sort: {
+          candleTime: 1
+        }
+      },
+
       {
         $group: {
           _id: {
             $dateTrunc: {
-              date: "$tradeTime",
+              date: "$candleTime",
               unit: bucket.unit,
               binSize: bucket.binSize,
               timezone: "UTC"
             }
           },
-          // Input is newest-first, so first=close and last=open.
-          open: { $last: "$price" },
-          high: { $max: "$price" },
-          low: { $min: "$price" },
-          close: { $first: "$price" },
-          volume: { $sum: "$quantity" },
-          quoteVolume: { $sum: { $multiply: ["$price", "$quantity"] } },
-          trades: { $sum: 1 }
+
+          open: {
+            $first: "$open"
+          },
+
+          high: {
+            $max: "$high"
+          },
+
+          low: {
+            $min: "$low"
+          },
+
+          close: {
+            $last: "$close"
+          },
+
+          volume: {
+            $sum: "$volume"
+          },
+
+          quoteVolume: {
+            $sum: "$quoteVolume"
+          },
+
+          trades: {
+            $sum: "$trades"
+          }
         }
       },
-      { $sort: { _id: 1 } },
+
+      {
+        $sort: {
+          _id: 1
+        }
+      },
+
       {
         $project: {
           _id: 0,
@@ -177,7 +755,8 @@ app.get("/api/market/history", async (req, res) => {
           trades: 1
         }
       }
-    ]).allowDiskUse(true);
+
+    ]).allowDiskUse(false);
 
     res.json({
       symbol,
@@ -188,59 +767,62 @@ app.get("/api/market/history", async (req, res) => {
       count: candles.length,
       candles
     });
+
   } catch (error) {
-    console.error("Historical market data API error:", error.message);
-    res.status(500).json({ error: "Unable to retrieve historical market data." });
+    console.error(
+      "History API error:",
+      error.message
+    );
+
+    res.status(500).json({
+      error: "Unable to load candle history."
+    });
   }
 });
+
 
 // -------------------------------------
 // ALERT HISTORY API
 // -------------------------------------
 
-// Supports: /api/alerts?symbol=BTCUSDT&type=VOLUME_SPIKE&severity=HIGH&limit=50&page=1
 app.get("/api/alerts", async (req, res) => {
   try {
-    const filter = {};
+    const filter = {
+      timestamp: {
+        $gte: new Date(Date.now() - RETENTION_MS)
+      }
+    };
 
     if (req.query.symbol) {
-      filter.symbol = String(req.query.symbol).toUpperCase();
+      filter.symbol = String(
+        req.query.symbol
+      ).toUpperCase();
     }
 
     if (req.query.type) {
-      filter.type = String(req.query.type).toUpperCase();
+      filter.type = String(
+        req.query.type
+      ).toUpperCase();
     }
 
     if (req.query.severity) {
-      filter.severity = String(req.query.severity).toUpperCase();
+      filter.severity = String(
+        req.query.severity
+      ).toUpperCase();
     }
 
-    if (req.query.from || req.query.to) {
-      filter.timestamp = {};
-      if (req.query.from) {
-        const from = new Date(req.query.from);
-        if (Number.isNaN(from.getTime())) {
-          return res.status(400).json({ error: "Invalid 'from' date." });
-        }
-        filter.timestamp.$gte = from;
-      }
-      if (req.query.to) {
-        const to = new Date(req.query.to);
-        if (Number.isNaN(to.getTime())) {
-          return res.status(400).json({ error: "Invalid 'to' date." });
-        }
-        filter.timestamp.$lte = to;
-      }
-    }
+    const limit = Math.min(
+      Math.max(
+        Number.parseInt(req.query.limit, 10) || 50,
+        1
+      ),
+      200
+    );
 
-    const requestedLimit = Number.parseInt(req.query.limit, 10);
-    const requestedPage = Number.parseInt(req.query.page, 10);
-    const limit = Number.isFinite(requestedLimit)
-      ? Math.min(Math.max(requestedLimit, 1), 200)
-      : 50;
-    const page = Number.isFinite(requestedPage)
-      ? Math.max(requestedPage, 1)
-      : 1;
+    const page = Math.max(
+      Number.parseInt(req.query.page, 10) || 1,
+      1
+    );
 
     const [alerts, total] = await Promise.all([
       Alert.find(filter)
@@ -248,11 +830,13 @@ app.get("/api/alerts", async (req, res) => {
         .skip((page - 1) * limit)
         .limit(limit)
         .lean(),
+
       Alert.countDocuments(filter)
     ]);
 
     res.json({
       alerts,
+
       pagination: {
         total,
         page,
@@ -260,801 +844,208 @@ app.get("/api/alerts", async (req, res) => {
         pages: Math.ceil(total / limit)
       }
     });
+
   } catch (error) {
-    console.error("Alert history API error:", error.message);
-    res.status(500).json({ error: "Unable to retrieve alert history." });
-  }
-});
-
-// Health check API
-app.get("/health", (req, res) => {
-  res.json({
-    status: "running",
-    database: mongoose.connection.readyState === 1 ? "connected" : "disconnected",
-    connectedClients: io.engine.clientsCount,
-    pendingAlerts: alertBuffer.length,
-    timestamp: new Date()
-  });
-});
-
-// Detailed system status, including estimated MongoDB storage usage.
-app.get("/api/system/status", async (req, res) => {
-  try {
-    const storage = await getStorageStats();
-    res.json({
-      status: "running",
-      database: mongoose.connection.readyState === 1 ? "connected" : "disconnected",
-      symbols,
-      storage,
-      cleaner: {
-        enabled: STORAGE_CLEANER_ENABLED,
-        running: storageCleanupRunning,
-        modelsReady,
-        lastCleanupAt: lastStorageCleanupAt,
-        lastCleanupDeleted: lastStorageCleanupDeleted,
-        lastCleanupReason: lastStorageCleanupReason,
-        thresholdsMB: STORAGE_THRESHOLDS_MB
-      },
-      buffers: {
-        trades: writeBuffer.length,
-        alerts: alertBuffer.length,
-        broadcasts: outboundBatch.length
-      },
-      connectedClients: io.engine.clientsCount,
-      timestamp: new Date()
-    });
-  } catch (error) {
-    res.status(500).json({ error: "Unable to retrieve system status." });
-  }
-});
-
-// MARKET STATE
-// -------------------------------------
-
-const marketState = {};
-
-symbols.forEach(symbol => {
-  marketState[symbol] = {
-    totalEvents: 0,
-    currentPrice: 0,
-    recentTrades: [],
-    volume10s: 0,
-    trades10s: 0
-  };
-});
-
-let totalReceived = 0;
-let totalProcessed = 0;
-let totalPersisted = 0;
-let invalidEvents = 0;
-let duplicateEvents = 0;
-let dbErrors = 0;
-let droppedEvents = 0;
-
-let intervalEvents = 0;
-let writeBuffer = [];
-let alertBuffer = [];
-let outboundBatch = [];
-
-let isFlushing = false;
-let isFlushingAlerts = false;
-let socket;
-
-let totalProcessingTime = 0;
-let processingSamples = 0;
-let maxProcessingTime = 0;
-
-let statsTimer;
-let flushTimer;
-let broadcastTimer;
-let storageTimer;
-let lastStorageCleanupAt = null;
-let lastStorageCleanupDeleted = 0;
-let lastStorageCleanupReason = "Not run yet";
-let lastStorageStats = null;
-let storageCleanupRunning = false;
-let modelsReady = false;
-let snapshotTimer;
-
-// -------------------------------------
-// STORAGE MONITOR + CONTROLLED CLEANER
-// -------------------------------------
-
-function mb(bytes) {
-  return Number((bytes / (1024 * 1024)).toFixed(2));
-}
-
-function getStorageLevel(usedMB) {
-  if (usedMB >= STORAGE_THRESHOLDS_MB.critical) return "CRITICAL";
-  if (usedMB >= STORAGE_THRESHOLDS_MB.aggressive) return "AGGRESSIVE";
-  if (usedMB >= STORAGE_THRESHOLDS_MB.cleanup) return "CLEANUP";
-  if (usedMB >= STORAGE_THRESHOLDS_MB.monitor) return "MONITOR";
-  return "NORMAL";
-}
-
-async function getStorageStats() {
-  const db = mongoose.connection.db;
-  if (!db) throw new Error("MongoDB database handle is not ready.");
-
-  // This is the MarketPulseDB logical footprint, not the Atlas cluster-wide
-  // quota meter. Atlas may include other databases and replica-set overhead.
-  // db.stats(1) returns byte counts. Convert every byte metric to MB
-  // before comparing it with the 400/440/460/480 MB thresholds.
-  const stats = await db.stats(1);
-  const dataBytes = Number(stats.dataSize || 0);
-  const indexBytes = Number(stats.indexSize || 0);
-  const allocatedBytes = Number(stats.storageSize || 0);
-  const logicalBytes = dataBytes + indexBytes;
-
-  const result = {
-    database: db.databaseName,
-    usedMB: mb(logicalBytes),
-    dataMB: mb(dataBytes),
-    indexMB: mb(indexBytes),
-    storageAllocatedMB: mb(allocatedBytes),
-    collections: Number(stats.collections || 0),
-    objects: Number(stats.objects || 0),
-    level: getStorageLevel(mb(logicalBytes)),
-    thresholdsMB: STORAGE_THRESHOLDS_MB,
-    source: "MongoDB db.stats(1) byte values converted to MB: (dataSize + indexSize) / 1048576 for MarketPulseDB",
-    limitation: "This is a database-level estimate, not Atlas cluster-wide Data Size. Compare it with Atlas Metrics."
-  };
-
-  lastStorageStats = result;
-  return result;
-}
-
-function cleanupRoundsForLevel(level) {
-  if (level === "CRITICAL") return STORAGE_MAX_ROUNDS_PER_CHECK;
-  if (level === "AGGRESSIVE") return 2;
-  if (level === "CLEANUP") return 1;
-  return 0;
-}
-
-async function deleteOldestTradesForSymbol(symbol, limit) {
-  const oldest = await Trade.find({ symbol })
-    .sort({ tradeTime: 1, tradeId: 1 })
-    .limit(limit)
-    .select({ _id: 1 })
-    .lean();
-
-  if (oldest.length === 0) return 0;
-
-  const result = await Trade.deleteMany({
-    _id: { $in: oldest.map(item => item._id) }
-  });
-
-  return Number(result.deletedCount || 0);
-}
-
-async function runStorageCheck() {
-  if (!STORAGE_CLEANER_ENABLED || storageCleanupRunning ||
-      mongoose.connection.readyState !== 1) return;
-
-  storageCleanupRunning = true;
-
-  try {
-    let storage = await getStorageStats();
-    console.log(
-      `[Storage] MarketPulseDB logical footprint: ${storage.usedMB} MB ` +
-      `(${storage.level}); data=${storage.dataMB} MB, indexes=${storage.indexMB} MB.`
+    console.error(
+      "Alerts API error:",
+      error.message
     );
 
-    const rounds = cleanupRoundsForLevel(storage.level);
-    if (rounds === 0) {
-      lastStorageCleanupReason = `No cleanup required (${storage.level}).`;
-      return;
-    }
-
-    if (lastStorageCleanupAt &&
-        Date.now() - lastStorageCleanupAt.getTime() < STORAGE_RETRY_COOLDOWN_MS) {
-      lastStorageCleanupReason = "Cleanup cooldown active; monitoring continues.";
-      return;
-    }
-
-    let totalDeleted = 0;
-    for (let round = 1; round <= rounds; round++) {
-      let roundDeleted = 0;
-
-      // Identical per-symbol allowance: no coin receives preferential treatment.
-      for (const symbol of symbols) {
-        roundDeleted += await deleteOldestTradesForSymbol(
-          symbol,
-          STORAGE_CLEANUP_BATCH_PER_SYMBOL
-        );
-      }
-
-      totalDeleted += roundDeleted;
-      if (roundDeleted === 0) break;
-
-      await new Promise(resolve => setTimeout(resolve, 1000));
-      const after = await getStorageStats();
-
-      console.log(
-        `[Storage] Round ${round}/${rounds}: deleted ${roundDeleted} trades; ` +
-        `database logical footprint now ${after.usedMB} MB.`
-      );
-
-      // Compare the database logical footprint, not allocated WiredTiger bytes.
-      // If it does not improve, stop rather than deleting repeatedly without evidence.
-      if (after.usedMB >= storage.usedMB - STORAGE_MIN_PROGRESS_MB) {
-        storage = after;
-        console.warn(
-          "[Storage] Logical database size did not fall by at least " +
-          `${STORAGE_MIN_PROGRESS_MB} MB. Stopping cleanup; check Atlas Metrics separately.`
-        );
-        break;
-      }
-
-      storage = after;
-      if (storage.usedMB < STORAGE_THRESHOLDS_MB.cleanup) break;
-    }
-
-    lastStorageCleanupAt = new Date();
-    lastStorageCleanupDeleted = totalDeleted;
-    lastStorageCleanupReason =
-      `Pressure cleanup completed; deleted ${totalDeleted} oldest trades ` +
-      "with equal per-symbol batch limits.";
-
-    if (totalDeleted > 0) {
-      console.warn(
-        `[Storage] Deleted ${totalDeleted} trades. Under pressure, retained raw history ` +
-        "may be shorter than 24 hours."
-      );
-    }
-  } catch (error) {
-    lastStorageCleanupReason = `Storage check failed: ${error.message}`;
-    // Avoid hammering Atlas when quota restrictions or permissions block cleanup.
-    lastStorageCleanupAt = new Date();
-    console.error("[Storage] Monitor/cleaner error:", error.message);
-  } finally {
-    storageCleanupRunning = false;
+    res.status(500).json({
+      error: "Unable to load alerts."
+    });
   }
-}
+});
+
 
 // -------------------------------------
 // SOCKET.IO CONNECTIONS
 // -------------------------------------
 
-function getMarketSnapshot() {
-  const snapshot = {};
-
-  symbols.forEach(symbol => {
-    const state = marketState[symbol];
-
-    snapshot[symbol] = {
-      symbol,
-      price: state.currentPrice,
-      volume10s: state.volume10s,
-      trades10s: state.trades10s,
-      totalEvents: state.totalEvents
-    };
-  });
-
-  return snapshot;
-}
-
-io.on("connection", client => {
-  console.log("Frontend client connected:", client.id);
-
-  // Send current market state to newly connected clients.
-  client.emit("market:snapshot", getMarketSnapshot());
-
-  // Give newly connected clients a recent persisted alert history.
-  Alert.find()
-    .sort({ timestamp: -1 })
-    .limit(20)
-    .lean()
-    .then(alerts => client.emit("market:alerts:history", alerts))
-    .catch(error => {
-      console.error("Unable to load alert history for client:", error.message);
-    });
-
-  client.on("disconnect", reason => {
-    console.log("Frontend client disconnected:", reason);
-  });
-});
-
-// -------------------------------------
-// EVENT NORMALIZATION
-// -------------------------------------
-
-function normalizeEvent(trade) {
-  const price = Number(trade.p);
-  const quantity = Number(trade.q);
-
-  if (
-    !symbols.includes(trade.s) ||
-    !Number.isSafeInteger(trade.t) ||
-    !Number.isFinite(price) ||
-    !Number.isFinite(quantity) ||
-    price <= 0 ||
-    quantity <= 0 ||
-    !Number.isFinite(trade.T)
-  ) {
-    return null;
-  }
-
-  return {
-    source: "BINANCE",
-    symbol: trade.s,
-    tradeId: trade.t,
-    price,
-    quantity,
-    tradeTime: new Date(trade.T),
-    eventTime: Number.isFinite(trade.E)
-      ? new Date(trade.E)
-      : undefined,
-    receivedAt: new Date(),
-    isBuyerMaker: trade.m
-  };
-}
-
-// -------------------------------------
-// ROLLING MARKET ANALYTICS
-// -------------------------------------
-
-function updateAnalytics(event) {
-  const state = marketState[event.symbol];
-
-  state.currentPrice = event.price;
-  state.totalEvents++;
-
-  state.recentTrades.push({
-    time: event.tradeTime.getTime(),
-    price: event.price,
-    quantity: event.quantity
-  });
-
-  state.volume10s += event.quantity;
-
-  const cutoff = Date.now() - 10000;
-
-  while (
-    state.recentTrades.length > 0 &&
-    state.recentTrades[0].time < cutoff
-  ) {
-    const expired = state.recentTrades.shift();
-    state.volume10s -= expired.quantity;
-  }
-
-  state.trades10s = state.recentTrades.length;
-}
-
-// -------------------------------------
-// PROCESS EVENTS
-// -------------------------------------
-
-function processEvent(rawTrade) {
-  const start = performance.now();
-
-  totalReceived++;
-
-  const event = normalizeEvent(rawTrade);
-
-  if (!event) {
-    invalidEvents++;
-    return;
-  }
-
-  if (writeBuffer.length >= MAX_BUFFER_SIZE) {
-    droppedEvents++;
-    return;
-  }
-
-// -------------------------------------
-// MARKET INTELLIGENCE ANALYSIS
-// -------------------------------------
-
-    const alerts = marketAnalytics.processTrade(event);
-
-// Broadcast detected anomalies.
-
-    if (alerts.length > 0) {
-
-        alerts.forEach(alert => {
-            if (alertBuffer.length < MAX_ALERT_BUFFER_SIZE) {
-              alertBuffer.push(alert);
-            } else {
-              console.error("Alert persistence buffer is full; alert was not queued:", alert.id);
-            }
-
-            console.log("\n========== MARKET ALERT ==========");
-
-            console.log("Type:", alert.type);
-            console.log("Asset:", alert.symbol);
-            console.log("Severity:", alert.severity);
-            console.log("Message:", alert.message);
-
-            console.log("==================================\n");
-
-        });
-
-        io.emit("market:alerts", alerts);
-
-    }
-
-// -------------------------------------
-// EXISTING DATA PIPELINE
-// -------------------------------------
-
-    updateAnalytics(event);
-
-    writeBuffer.push(event);
-    outboundBatch.push(event);
-
-    totalProcessed++;
-    intervalEvents++;
-
-  const elapsed = performance.now() - start;
-
-  totalProcessingTime += elapsed;
-  processingSamples++;
-
-  maxProcessingTime = Math.max(
-    maxProcessingTime,
-    elapsed
+io.on("connection", socket => {
+  console.log(
+    "Frontend connected:",
+    socket.id
   );
 
-  if (writeBuffer.length >= BATCH_SIZE) {
-    void flushTrades();
-  }
-}
+  socket.emit(
+    "market:snapshot",
+    marketSnapshot()
+  );
 
-// -------------------------------------
-// MONGODB BATCH WRITER
-// -------------------------------------
-
-async function flushTrades() {
-  if (isFlushing || writeBuffer.length === 0) {
-    return;
-  }
-
-  isFlushing = true;
-
-  const batch = writeBuffer.splice(0, BATCH_SIZE);
-
-  try {
-    const operations = batch.map(event => ({
-      updateOne: {
-        filter: {
-          symbol: event.symbol,
-          tradeId: event.tradeId
-        },
-        update: {
-          $setOnInsert: event
-        },
-        upsert: true
-      }
-    }));
-
-    const result = await Trade.bulkWrite(
-      operations,
-      { ordered: false }
-    );
-
-    totalPersisted += result.upsertedCount;
-    duplicateEvents += result.matchedCount;
-
-  } catch (error) {
-    dbErrors++;
-
-    console.error("MongoDB write error:", error.message);
-
-    const available = MAX_BUFFER_SIZE - writeBuffer.length;
-    const retryBatch = batch.slice(0, available);
-
-    writeBuffer = retryBatch.concat(writeBuffer);
-
-    droppedEvents += batch.length - retryBatch.length;
-
-  } finally {
-    isFlushing = false;
-  }
-}
-
-// -------------------------------------
-// MONGODB ALERT WRITER
-// -------------------------------------
-
-async function flushAlerts() {
-  if (isFlushingAlerts || alertBuffer.length === 0) {
-    return;
-  }
-
-  isFlushingAlerts = true;
-  const batch = alertBuffer.splice(0, ALERT_BATCH_SIZE);
-
-  try {
-    const operations = batch.map(alert => ({
-      updateOne: {
-        filter: { alertId: alert.id },
-        update: {
-          $setOnInsert: {
-            alertId: alert.id,
-            type: alert.type,
-            symbol: alert.symbol,
-            message: alert.message,
-            severity: alert.severity,
-            observedValue: alert.observedValue,
-            baselineValue: alert.baselineValue,
-            changePct: alert.changePct,
-            timestamp: alert.timestamp
-          }
-        },
-        upsert: true
-      }
-    }));
-
-    await Alert.bulkWrite(operations, { ordered: false });
-  } catch (error) {
-    console.error("MongoDB alert write error:", error.message);
-    const available = MAX_ALERT_BUFFER_SIZE - alertBuffer.length;
-    const retryBatch = batch.slice(0, available);
-    alertBuffer = retryBatch.concat(alertBuffer);
-
-    if (retryBatch.length < batch.length) {
-      console.error("Some alerts could not be re-queued because the alert buffer is full.");
+  Alert.find({
+    timestamp: {
+      $gte: new Date(Date.now() - RETENTION_MS)
     }
-  } finally {
-    isFlushingAlerts = false;
-  }
-}
+  })
+    .sort({ timestamp: -1 })
+    .limit(30)
+    .lean()
+
+    .then(rows => {
+      socket.emit(
+        "market:alerts:history",
+        rows
+      );
+    })
+
+    .catch(error => {
+      console.error(
+        "Alert history socket error:",
+        error.message
+      );
+    });
+});
+
 
 // -------------------------------------
-// SOCKET.IO MARKET BROADCASTING
+// START APPLICATION
 // -------------------------------------
 
-function broadcastMarketUpdates() {
-  if (outboundBatch.length === 0) {
-    return;
-  }
-
-  // Send a batch of processed trades to connected clients.
-  const batch = outboundBatch.splice(0);
-
-  io.emit("market:trades", batch);
-}
-
-function broadcastMarketSnapshot() {
-  io.emit("market:snapshot", getMarketSnapshot());
-}
-
-// -------------------------------------
-// BINANCE CONNECTION
-// -------------------------------------
-
-function startBinanceStream() {
-  socket = new WebSocket(BINANCE_URL);
-
-  socket.on("open", () => {
-    console.log("Binance WebSocket connected.");
-    console.log("Monitoring:", symbols.join(", "));
-  });
-
-  socket.on("message", rawData => {
-    try {
-      const message = JSON.parse(rawData.toString());
-
-      if (message.data) {
-        processEvent(message.data);
-      }
-
-    } catch (error) {
-      console.error("Event parsing error:", error.message);
+async function start() {
+  try {
+    if (!process.env.MONGODB_URI) {
+      throw new Error(
+        "MONGODB_URI is missing from the root .env file."
+      );
     }
-  });
 
-  socket.on("error", error => {
-    console.error("Binance connection error:", error.message);
-  });
+    await connectDB();
 
-  socket.on("close", code => {
-    console.log("Binance connection closed:", code);
-  });
-}
+    await ensureThreeHourTTL(Candle, "candleTime");
+    await ensureThreeHourTTL(Alert, "timestamp");
 
-// -------------------------------------
-// PERFORMANCE MONITORING
-// -------------------------------------
-
-function startMonitoring() {
-  statsTimer = setInterval(() => {
-    console.clear();
-
-    console.log("========== MARKETPULSE SERVER ==========\n");
-
-    console.log("Received:", totalReceived);
-    console.log("Processed:", totalProcessed);
-    console.log("Persisted:", totalPersisted);
-    console.log("Invalid:", invalidEvents);
-    console.log("Duplicates:", duplicateEvents);
-    console.log("Database errors:", dbErrors);
-    console.log("Dropped:", droppedEvents);
+    await Promise.all([
+      Candle.init(),
+      Alert.init()
+    ]);
 
     console.log(
-      "Throughput:",
-      (intervalEvents / 5).toFixed(2),
-      "events/sec"
+      "MongoDB candle and alert indexes are ready."
     );
 
     console.log(
-      "Average processing time:",
-      processingSamples
-        ? (totalProcessingTime / processingSamples).toFixed(4)
-        : 0,
-      "ms"
+      "Retention: 3 hours. Raw individual trades are not persisted."
     );
 
-    console.log(
-      "Maximum processing time:",
-      maxProcessingTime.toFixed(4),
-      "ms"
-    );
+    snapshotTimer = setInterval(() => {
+      io.emit(
+        "market:snapshot",
+        marketSnapshot()
+      );
+    }, 2000);
 
-    console.log("Pending DB buffer:", writeBuffer.length);
-    console.log("Pending broadcast buffer:", outboundBatch.length);
+    liveStatsTimer = setInterval(() => {
+      const cutoff = Date.now() - 10000;
 
-    console.log("Connected clients:", io.engine.clientsCount);
+      for (const state of Object.values(market)) {
+        while (
+          state.recentTrades.length &&
+          state.recentTrades[0].time < cutoff
+        ) {
+          state.recentTrades.shift();
+        }
 
-    console.log("\n----------- MARKET STATE -----------");
+        state.trades10s = state.recentTrades.length;
 
-    symbols.forEach(symbol => {
-      const state = marketState[symbol];
+        state.volume10s = state.recentTrades.reduce(
+          (sum, item) => sum + item.quantity,
+          0
+        );
+      }
+    }, 1000);
 
-      console.log("\n" + symbol);
-      console.log("Price:", state.currentPrice);
-      console.log("10-sec volume:", state.volume10s.toFixed(6));
-      console.log("10-sec trades:", state.trades10s);
+    writeFlushTimer = setInterval(() => {
+      void flushAllWrites();
+    }, WRITE_FLUSH_INTERVAL_MS);
+
+    server.listen(PORT, () => {
+      console.log(
+        `MarketPulse API running at http://localhost:${PORT}`
+      );
+
+      connectBinance();
     });
 
-    console.log("\n======================================");
+  } catch (error) {
+    console.error(
+      "MarketPulse startup failed:",
+      error.message
+    );
 
-    intervalEvents = 0;
-
-  }, 5000);
-
-  flushTimer = setInterval(() => {
-    void flushTrades();
-    void flushAlerts();
-  }, FLUSH_INTERVAL);
-
-  broadcastTimer = setInterval(() => {
-    broadcastMarketUpdates();
-  }, BROADCAST_INTERVAL);
-
-  // Periodically refresh market snapshots for clients.
-  snapshotTimer = setInterval(broadcastMarketSnapshot, 2000);
-
-  // Storage monitoring is independent of the market-data write pipeline.
-  void runStorageCheck();
-  storageTimer = setInterval(() => {
-    void runStorageCheck();
-  }, STORAGE_CHECK_INTERVAL_MS);
+    process.exit(1);
+  }
 }
 
-// -------------------------------------
-// SHUTDOWN
-// -------------------------------------
 
-let shuttingDown = false;
+// -------------------------------------
+// GRACEFUL SHUTDOWN
+// -------------------------------------
 
 async function shutdown() {
-  if (shuttingDown) return;
+  if (isShuttingDown) return;
 
-  shuttingDown = true;
+  isShuttingDown = true;
 
-  console.log("\nStopping MarketPulse...");
+  console.log("Stopping MarketPulse...");
 
-  clearInterval(statsTimer);
-  clearInterval(flushTimer);
-  clearInterval(broadcastTimer);
-  clearInterval(storageTimer);
   clearInterval(snapshotTimer);
+  clearInterval(liveStatsTimer);
+  clearInterval(writeFlushTimer);
 
-  if (socket) {
-    socket.close();
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
   }
 
-  broadcastMarketUpdates();
-
-  // Wait for an active database write.
-  while (isFlushing || isFlushingAlerts) {
-    await new Promise(resolve => setTimeout(resolve, 100));
+  if (binanceSocket) {
+    try {
+      binanceSocket.close();
+    } catch (_) {}
   }
 
-  // Flush remaining records.
-  let attempts = 0;
+  // Drain queued batches before closing MongoDB.
+  // The cap prevents shutdown from hanging forever
+  // if Atlas is temporarily rejecting writes.
 
-  while (writeBuffer.length > 0 && attempts < 3) {
-    await flushTrades();
-
-    if (writeBuffer.length > 0) {
-      attempts++;
-      await new Promise(resolve => setTimeout(resolve, 1000));
+  for (let attempt = 0; attempt < 5; attempt++) {
+    if (
+      pendingCandles.size === 0 &&
+      pendingAlerts.length === 0
+    ) {
+      break;
     }
+
+    await Promise.all([
+      flushCandleWrites(),
+      flushAlertWrites()
+    ]);
   }
 
-  if (writeBuffer.length > 0) {
-    console.error("Warning: some database records remain unpersisted.");
-  }
-
-  let alertAttempts = 0;
-  while (alertBuffer.length > 0 && alertAttempts < 3) {
-    await flushAlerts();
-    if (alertBuffer.length > 0) {
-      alertAttempts++;
-      await new Promise(resolve => setTimeout(resolve, 1000));
-    }
-  }
-
-  if (alertBuffer.length > 0) {
-    console.error("Warning: some alerts remain unpersisted.");
+  if (
+    pendingCandles.size ||
+    pendingAlerts.length
+  ) {
+    console.error(
+      `Shutdown with ${pendingCandles.size} pending candles and ${pendingAlerts.length} pending alerts. ` +
+      "Atlas may have rejected writes; check logs before restarting."
+    );
   }
 
   io.close();
 
-  await mongoose.disconnect();
+  await new Promise(resolve => server.close(resolve));
 
-  console.log("MongoDB disconnected.");
-  console.log("MarketPulse stopped.");
+  await mongoose.disconnect();
 
   process.exit(0);
 }
 
-process.on("SIGINT", shutdown);
+process.on("SIGINT", () => {
+  void shutdown();
+});
 
-// -------------------------------------
-// APPLICATION STARTUP
-// -------------------------------------
+process.on("SIGTERM", () => {
+  void shutdown();
+});
 
-async function startApplication() {
-  console.log("Connecting to MongoDB...");
-
-  try {
-    await connectDB();
-    console.log("MongoDB connected. Starting HTTP service and storage monitor.");
-
-    // Start health/status endpoints even if model index initialization fails.
-    server.listen(PORT, async () => {
-      console.log(`MarketPulse server running on port ${PORT}`);
-      console.log(`Health check: http://localhost:${PORT}/health`);
-      console.log(`System status: http://localhost:${PORT}/api/system/status`);
-
-      // Start the monitor before attempting model initialization.
-      void getStorageStats()
-        .then(stats => console.log(`[Storage] Initial database footprint: ${stats.usedMB} MB.`))
-        .catch(error => console.error("[Storage] Initial check failed:", error.message));
-
-      // Try a controlled cleanup before index initialization. This can help
-      // when Atlas quota pressure is preventing index creation. If collections
-      // are absent or deletes are blocked, the attempt logs the failure safely.
-      void runStorageCheck();
-
-      try {
-        await Trade.init();
-        await Alert.init();
-        modelsReady = true;
-        console.log("MongoDB models and indexes ready.");
-
-        // Run a pressure check immediately after models become usable.
-        void runStorageCheck();
-
-        startBinanceStream();
-        startMonitoring();
-      } catch (error) {
-        modelsReady = false;
-        console.error("Model initialization failed; HTTP status service remains available:", error.message);
-        console.error("Binance collection has NOT been started. Resolve the model/index issue, then restart.");
-        // Keep the server alive so health and storage status can still be inspected.
-        storageTimer = setInterval(() => {
-          void runStorageCheck();
-        }, STORAGE_CHECK_INTERVAL_MS);
-      }
-    });
-  } catch (error) {
-    console.error("MongoDB connection failed. HTTP service cannot start:", error.message);
-    process.exitCode = 1;
-  }
-}
-startApplication();
+void start();
